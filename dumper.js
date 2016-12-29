@@ -11,7 +11,7 @@ if (!INPUT_FILE || !OUTPUT_DIR) {
 	process.exit(1);
 }
 
-lib_extract_moray.load_buckets_config(INPUT_FILE, function (err, buckets) {
+lib_extract.load_buckets_config(INPUT_FILE, function (err, buckets) {
 	if (err) {
 		console.error('ERROR: %s', err.stack);
 		process.exit(2);
@@ -19,7 +19,7 @@ lib_extract_moray.load_buckets_config(INPUT_FILE, function (err, buckets) {
 
 	//console.log(mod_util.inspect(buckets, false, 10, true));
 
-	lib_extract_moray.extract_buckets_to_files(INPUT_FILE,
+	lib_extract.extract_buckets_to_files(INPUT_FILE,
 	    OUTPUT_DIR, buckets, function (err) {
 		if (err) {
 			console.error('ERROR: %s', err.stack);
