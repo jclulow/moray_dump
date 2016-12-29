@@ -1,0 +1,12 @@
+{
+  "name": "moray_dump",
+  "version": "0.0.0",
+  "description": "",
+  "main": "dumper.js",
+  "dependencies": {
+    "pg_dump": "git+https://github.com/joyent/node-pg_dump.git#master"
+  },
+  "devDependencies": {},
+  "author": "",
+  "license": "ISC"
+}
