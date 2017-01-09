@@ -260,11 +260,11 @@ json_emit_utf8string(json_emit_t *jse, const char *utf8str)
 		case '"':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, '\"');
-			break;
+			continue;
 		case '\\':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, '\\');
-			break;
+			continue;
 
 		/*
 		 * Control characters with C-style escape sequences:
@@ -272,23 +272,23 @@ json_emit_utf8string(json_emit_t *jse, const char *utf8str)
 		case '\b':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 'b');
-			break;
+			continue;
 		case '\f':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 'f');
-			break;
+			continue;
 		case '\n':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 'n');
-			break;
+			continue;
 		case '\r':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 'r');
-			break;
+			continue;
 		case '\t':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 't');
-			break;
+			continue;
 		}
 
 		if (code <= 0x1F) {
