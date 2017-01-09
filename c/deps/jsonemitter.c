@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include <custr.h>
 
@@ -61,6 +62,9 @@ struct json_emit {
 
 	custr_t			*json_scratch;
 	int			json_error_scratch;
+
+	int			json_error_utf8;
+	uint8_t			json_error_utf8_byteval;
 };
 
 /*
@@ -132,6 +136,10 @@ json_get_error(json_emit_t *jse, char *buf, size_t bufsz)
 	} else if (jse->json_nbadfloats) {
 		kind = JSE_INVAL;
 		(void) snprintf(buf, bufsz, "unsupported floating point value");
+	} else if (jse->json_error_utf8 != 0) {
+		kind = JSE_INVAL;
+		(void) snprintf(buf, bufsz, "illegal UTF-8 byte (0x%02x)",
+		    (unsigned)jse->json_error_utf8_byteval);
 	} else {
 		kind = JSE_NONE;
 		if (bufsz > 0) {
@@ -164,7 +172,7 @@ static int
 json_has_error(json_emit_t *jse)
 {
 	return (jse->json_error_stdio != 0 || jse->json_depth_exceeded != 0 ||
-	    jse->json_error_scratch != 0);
+	    jse->json_error_scratch != 0 || jse->json_error_utf8 != 0);
 }
 
 static void
@@ -206,23 +214,68 @@ json_scratch_appendc(json_emit_t *jse, char c)
 	}
 }
 
+/*
+ * Emits a UTF-8 (or 7-bit clean ASCII) string, with appropriate translation of
+ * characters that must be escaped in the JSON representation.
+ */
 static void
 json_emit_utf8string(json_emit_t *jse, const char *utf8str)
 {
-#if 0
-	/* XXX This isn't right. */
-	json_emit(jse, "\"%s\"", utf8str);
-#else
+	unsigned utf8_more_bytes = 0;
+
 	custr_reset(jse->json_scratch);
 
-	json_scratch_appendc(jse, '\"');
 	for (const char *cp = utf8str; *cp != '\0'; cp++) {
 		char c = *cp;
+		unsigned char code = c;
+
+		if (utf8_more_bytes > 0) {
+			/*
+			 * We need to collect one or more additional
+			 * bytes to complete this UTF-8 multibyte character.
+			 *
+			 * Every continuation byte matches the bit pattern:
+			 * 	10xxxxxx
+			 */
+			if ((code & 0xC0) != 0x80) {
+				/*
+				 * This is not a valid continuation byte.
+				 */
+				jse->json_error_utf8 = EILSEQ;
+				jse->json_error_utf8_byteval = code;
+				return;
+			}
+
+			json_scratch_appendc(jse, c);
+			utf8_more_bytes--;
+			continue;
+		}
 
 		switch (c) {
+		/*
+		 * Regular characters that must be escaped include the
+		 * string delimiter itself (quotation mark), and the
+		 * escape sequence initiator (reverse solidus):
+		 */
 		case '"':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, '\"');
+			break;
+		case '\\':
+			json_scratch_appendc(jse, '\\');
+			json_scratch_appendc(jse, '\\');
+			break;
+
+		/*
+		 * Control characters with C-style escape sequences:
+		 */
+		case '\b':
+			json_scratch_appendc(jse, '\\');
+			json_scratch_appendc(jse, 'b');
+			break;
+		case '\f':
+			json_scratch_appendc(jse, '\\');
+			json_scratch_appendc(jse, 'f');
 			break;
 		case '\n':
 			json_scratch_appendc(jse, '\\');
@@ -232,35 +285,79 @@ json_emit_utf8string(json_emit_t *jse, const char *utf8str)
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 'r');
 			break;
-		case '\\':
-			json_scratch_appendc(jse, '\\');
-			json_scratch_appendc(jse, '\\');
-			break;
-		case '\f':
-			json_scratch_appendc(jse, '\\');
-			json_scratch_appendc(jse, 'f');
-			break;
 		case '\t':
 			json_scratch_appendc(jse, '\\');
 			json_scratch_appendc(jse, 't');
 			break;
-		case '\b':
-			json_scratch_appendc(jse, '\\');
-			json_scratch_appendc(jse, 'b');
-			break;
-		default:
+		}
+
+		if (code <= 0x1F) {
 			/*
-			 * XXX this isn't right either.
+			 * This is a control character that was not handled
+			 * above.  Use the four hex digit escape sequence.
+			 */
+			char num[5];
+
+			(void) snprintf(num, 5, "%04x", (unsigned)code);
+
+			json_scratch_appendc(jse, '\\');
+			json_scratch_appendc(jse, 'u');
+			json_scratch_appendc(jse, num[0]);
+			json_scratch_appendc(jse, num[1]);
+			json_scratch_appendc(jse, num[2]);
+			json_scratch_appendc(jse, num[3]);
+			continue;
+		}
+
+		if (code <= 0x7F) {
+			/*
+			 * This is a regular ASCII character, and may be copied
+			 * directly into the output string.
 			 */
 			json_scratch_appendc(jse, c);
-			break;
+			continue;
 		}
+
+		/*
+		 * Check for a UTF-8 multibyte character.
+		 *
+		 * 	2-byte		110xxxxx
+		 * 	3-byte		1110xxxx
+		 * 	4-byte		11110xxx
+		 */
+		if ((code & 0xE0) == 0xC0) {
+			utf8_more_bytes = 1;
+		} else if ((code & 0xF0) == 0xE0) {
+			utf8_more_bytes = 2;
+		} else if ((code & 0xF8) == 0xF0) {
+			utf8_more_bytes = 3;
+		} else {
+			/*
+			 * This is not a valid UTF-8 character.
+			 */
+			jse->json_error_utf8 = EILSEQ;
+			jse->json_error_utf8_byteval = code;
+			return;
+		}
+
+		/*
+		 * For a valid UTF-8 multibyte character, we must copy all
+		 * related bytes into the output string together.  Copy the
+		 * first now; subsequent bytes will be checked and copied
+		 * because we set "utf8_more_bytes" above.
+		 */
+		json_scratch_appendc(jse, c);
 	}
-	json_scratch_appendc(jse, '\"');
+
+	if (utf8_more_bytes != 0) {
+		/*
+		 * The string ended in the middle of a character.
+		 */
+		jse->json_error_utf8 = EILSEQ;
+		return;
+	}
 
 	json_emit(jse, "\"%s\"", custr_cstr(jse->json_scratch));
-
-#endif
 }
 
 /*
