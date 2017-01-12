@@ -37,6 +37,11 @@ typedef enum {
 	JSON_ARRAY	/* an array is nested at the current depth */
 } json_depthdesc_t;
 
+typedef enum {
+	JSON_BACKING_STDIO,
+	JSON_BACKING_STRING
+} json_backing_t;
+
 /*
  * A note on depth management: We allow JSON documents to be nested up to
  * JSON_MAX_DEPTH.  In order to validate output as we emit it, we maintain a
@@ -47,7 +52,10 @@ typedef enum {
  * "json_nemitted[json_depth]".
  */
 struct json_emit {
+	json_backing_t		json_backing;
+
 	FILE			*json_stream;		/* output stream */
+	custr_t			*json_string;		/* output string */
 
 	/* Error conditions. */
 	int			json_error_stdio;	/* last stdio error */
@@ -82,8 +90,8 @@ static int json_assert_fail(const char *, const char *, int);
 
 static int json_has_error(json_emit_t *);
 
-JSON_PRINTFLIKE2 static void json_emit(json_emit_t *, const char *, ...);
-static void json_vemit(json_emit_t *, const char *, va_list);
+static void json_emits(json_emit_t *, const char *);
+static void json_emitc(json_emit_t *, char);
 static void json_emit_utf8string(json_emit_t *, const char *);
 static void json_emit_prepare(json_emit_t *, const char *);
 
@@ -96,13 +104,12 @@ static void json_nest_end(json_emit_t *, json_depthdesc_t);
  * Lifecycle management
  */
 
-json_emit_t *
-json_create_stdio(FILE *outstream)
+static json_emit_t *
+json_create_common(json_backing_t backing)
 {
 	json_emit_t *jse;
 
-	jse = calloc(1, sizeof (*jse));
-	if (jse == NULL) {
+	if ((jse = calloc(1, sizeof (*jse))) == NULL) {
 		return (NULL);
 	}
 
@@ -111,13 +118,50 @@ json_create_stdio(FILE *outstream)
 		return (NULL);
 	}
 
+	jse->json_backing = backing;
+
+	return (jse);
+}
+
+json_emit_t *
+json_create_stdio(FILE *outstream)
+{
+	json_emit_t *jse;
+
+	if ((jse = json_create_common(JSON_BACKING_STDIO)) == NULL) {
+		return (NULL);
+	}
+
 	jse->json_stream = outstream;
+
+	return (jse);
+}
+
+json_emit_t *
+json_create_string(void)
+{
+	json_emit_t *jse;
+
+	if ((jse = json_create_common(JSON_BACKING_STRING)) == NULL) {
+		return (NULL);
+	}
+
+	if (custr_alloc(&jse->json_string) != 0) {
+		int e = errno;
+
+		json_fini(jse);
+
+		errno = e;
+		return (NULL);
+	}
+
 	return (jse);
 }
 
 void
 json_fini(json_emit_t *jse)
 {
+	custr_free(jse->json_string);
 	custr_free(jse->json_scratch);
 	free(jse);
 }
@@ -151,6 +195,54 @@ json_get_error(json_emit_t *jse, char *buf, size_t bufsz)
 }
 
 /*
+ * Get a C string pointer for the current output buffer.  This pointer is
+ * invalidated as soon as a mutating function is called.
+ */
+const char *
+json_string_cstr(json_emit_t *jse)
+{
+	VERIFY(jse->json_backing == JSON_BACKING_STRING);
+
+	/*
+	 * The output string can only be read if the state machine has
+	 * returned to the rest state, similar to "json_newline()".
+	 */
+	VERIFY(json_nest_kind(jse) == JSON_NONE);
+	VERIFY(jse->json_depth == 0);
+
+	return (custr_cstr(jse->json_string));
+}
+
+size_t
+json_string_len(json_emit_t *jse)
+{
+	VERIFY(jse->json_backing == JSON_BACKING_STRING);
+
+	return (custr_len(jse->json_string));
+}
+
+/*
+ * Clear the accumulated C string.  Can be used after accumulating an
+ * entire JSON object for display, or to write to a file or socket,
+ * to get a clean slate for the next object.
+ */
+void
+json_string_clear(json_emit_t *jse)
+{
+	VERIFY(jse->json_backing == JSON_BACKING_STRING);
+
+	/*
+	 * The output string can only be reset if the state machine has
+	 * returned to the rest state, similar to "json_newline()".
+	 */
+	VERIFY(json_nest_kind(jse) == JSON_NONE);
+	VERIFY(jse->json_depth == 0);
+
+	custr_reset(jse->json_string);
+}
+
+
+/*
  * Helper functions
  */
 
@@ -176,28 +268,48 @@ json_has_error(json_emit_t *jse)
 }
 
 static void
-json_emit(json_emit_t *jse, const char *fmt, ...)
+json_emitc(json_emit_t *jse, char c)
 {
-	va_list args;
-
-	va_start(args, fmt);
-	json_vemit(jse, fmt, args);
-	va_end(args);
-}
-
-static void
-json_vemit(json_emit_t *jse, const char *fmt, va_list args)
-{
-	int rv;
-
 	if (json_has_error(jse)) {
 		jse->json_stdio_nskipped++;
 		return;
 	}
 
-	rv = vfprintf(jse->json_stream, fmt, args);
-	if (rv < 0) {
-		jse->json_error_stdio = errno;
+	switch (jse->json_backing) {
+	case JSON_BACKING_STDIO:
+		if (fprintf(jse->json_stream, "%c", c) < 0) {
+			jse->json_error_stdio = errno;
+		}
+		break;
+
+	case JSON_BACKING_STRING:
+		if (custr_appendc(jse->json_string, c) != 0) {
+			jse->json_error_stdio = errno;
+		}
+		break;
+	}
+}
+
+static void
+json_emits(json_emit_t *jse, const char *s)
+{
+	if (json_has_error(jse)) {
+		jse->json_stdio_nskipped++;
+		return;
+	}
+
+	switch (jse->json_backing) {
+	case JSON_BACKING_STDIO:
+		if (fprintf(jse->json_stream, "%s", s) < 0) {
+			jse->json_error_stdio = errno;
+		}
+		break;
+
+	case JSON_BACKING_STRING:
+		if (custr_append(jse->json_string, s) != 0) {
+			jse->json_error_stdio = errno;
+		}
+		break;
 	}
 }
 
@@ -357,7 +469,9 @@ json_emit_utf8string(json_emit_t *jse, const char *utf8str)
 		return;
 	}
 
-	json_emit(jse, "\"%s\"", custr_cstr(jse->json_scratch));
+	json_emitc(jse, '"');
+	json_emits(jse, custr_cstr(jse->json_scratch));
+	json_emitc(jse, '"');
 }
 
 /*
@@ -379,7 +493,7 @@ json_emit_prepare(json_emit_t *jse, const char *label)
 	kind = json_nest_kind(jse);
 	if ((kind == JSON_OBJECT || kind == JSON_ARRAY) &&
 	    jse->json_nemitted[jse->json_depth] > 0) {
-		json_emit(jse, ",");
+		json_emitc(jse, ',');
 	}
 
 	if (label == NULL) {
@@ -389,7 +503,7 @@ json_emit_prepare(json_emit_t *jse, const char *label)
 
 	VERIFY(kind == JSON_OBJECT);
 	json_emit_utf8string(jse, label);
-	json_emit(jse, ":");
+	json_emitc(jse, ':');
 }
 
 static void
@@ -441,6 +555,14 @@ json_nest_end(json_emit_t *jse, json_depthdesc_t kind)
 	jse->json_depth--;
 }
 
+static void
+json_emit_common(json_emit_t *jse, const char *label, const char *barevalue)
+{
+	json_emit_prepare(jse, label);
+	json_emits(jse, barevalue);
+	json_emit_finish(jse);
+}
+
 /*
  * Public emitter functions.
  */
@@ -449,7 +571,7 @@ void
 json_object_begin(json_emit_t *jse, const char *label)
 {
 	json_emit_prepare(jse, label);
-	json_emit(jse, "{");
+	json_emitc(jse, '{');
 	json_nest_begin(jse, JSON_OBJECT);
 }
 
@@ -457,7 +579,7 @@ void
 json_object_end(json_emit_t *jse)
 {
 	json_nest_end(jse, JSON_OBJECT);
-	json_emit(jse, "}");
+	json_emitc(jse, '}');
 	json_emit_finish(jse);
 }
 
@@ -465,7 +587,7 @@ void
 json_array_begin(json_emit_t *jse, const char *label)
 {
 	json_emit_prepare(jse, label);
-	json_emit(jse, "[");
+	json_emitc(jse, '[');
 	json_nest_begin(jse, JSON_ARRAY);
 }
 
@@ -473,7 +595,7 @@ void
 json_array_end(json_emit_t *jse)
 {
 	json_nest_end(jse, JSON_ARRAY);
-	json_emit(jse, "]");
+	json_emitc(jse, ']');
 	json_emit_finish(jse);
 }
 
@@ -486,53 +608,56 @@ json_newline(json_emit_t *jse)
 
 	VERIFY(json_nest_kind(jse) == JSON_NONE);
 	VERIFY(jse->json_depth == 0);
-	json_emit(jse, "\n");
+	json_emitc(jse, '\n');
 }
 
 void
 json_boolean(json_emit_t *jse, const char *label, json_boolean_t value)
 {
 	VERIFY(value == JSON_B_FALSE || value == JSON_B_TRUE);
-	json_emit_prepare(jse, label);
-	json_emit(jse, "%s", value == JSON_B_TRUE ? "true" : "false");
-	json_emit_finish(jse);
+
+	json_emit_common(jse, label, value == JSON_B_TRUE ? "true" : "false");
 }
 
 void
 json_null(json_emit_t *jse, const char *label)
 {
-	json_emit_prepare(jse, label);
-	json_emit(jse, "null");
-	json_emit_finish(jse);
+	json_emit_common(jse, label, "null");
 }
 
 void
 json_int64(json_emit_t *jse, const char *label, int64_t value)
 {
-	json_emit_prepare(jse, label);
-	json_emit(jse, "%" PRId64, value);
-	json_emit_finish(jse);
+	char buf[96];
+
+	(void) snprintf(buf, sizeof (buf), "%" PRId64, value);
+
+	json_emit_common(jse, label, buf);
 }
 
 void
 json_uint64(json_emit_t *jse, const char *label, uint64_t value)
 {
-	json_emit_prepare(jse, label);
-	json_emit(jse, "%" PRIu64, value);
-	json_emit_finish(jse);
+	char buf[96];
+
+	(void) snprintf(buf, sizeof (buf), "%" PRIu64, value);
+
+	json_emit_common(jse, label, buf);
 }
 
 void
 json_double(json_emit_t *jse, const char *label, double value)
 {
+	char buf[96];
+
 	if (!isfinite(value)) {
 		jse->json_nbadfloats++;
 		return;
 	}
 
-	json_emit_prepare(jse, label);
-	json_emit(jse, "%.10e", value);
-	json_emit_finish(jse);
+	(void) snprintf(buf, sizeof (buf), "%.10e", value);
+
+	json_emit_common(jse, label, buf);
 }
 
 void
