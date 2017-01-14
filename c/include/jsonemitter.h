@@ -132,6 +132,7 @@ typedef enum {
 } json_error_t;
 
 json_emit_t *json_create_stdio(FILE *);
+json_emit_t *json_create_string(void);
 json_error_t json_get_error(json_emit_t *, char *, size_t);
 void json_fini(json_emit_t *);
 
@@ -149,5 +150,12 @@ void json_int64(json_emit_t *, const char *, int64_t);
 void json_uint64(json_emit_t *, const char *, uint64_t);
 void json_double(json_emit_t *, const char *, double);
 void json_utf8string(json_emit_t *, const char *, const char *);
+
+/*
+ * For use with emitters created via json_create_string():
+ */
+const char *json_string_cstr(json_emit_t *);
+size_t json_string_len(json_emit_t *);
+void json_string_clear(json_emit_t *);
 
 #endif /* not defined _JSONEMITTER_H_ */
